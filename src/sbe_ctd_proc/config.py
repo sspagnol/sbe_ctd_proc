@@ -62,6 +62,7 @@ config_map = {
         'toml_path': ('paths', 'auditlog_file'),
         'may_not_exist': True
     },
+
     'db_enabled': ('database', 'enabled'),
     'db_mdb_file': ('database', 'mdb_file'),
     'db_mdw_file': ('database', 'mdw_file'),
@@ -77,6 +78,10 @@ config_map = {
 
     'latitude_method': ('options', 'latitude_method'),
     'latitude_spreadsheet_file': ('options', 'latitude_spreadsheet_file'),
+    
+    'processing_sequence': ('options','processing_sequence',),
+    'tz_mapping': ('options','tz_mapping',),
+    
     'chart_default_sensors': ('chart', 'default_sensors'),
 
     'date_difference_limit': {
@@ -168,6 +173,10 @@ class Config:
     # present if latitude_method is 'constant'
     constant_latitude: float
 
+    processing_sequence : Optional[list[dict[str, str]]]
+    
+    tz_mapping : dict[str, str]
+    
     oceandb: Optional[OceanDB]
 
     audit_log: Optional[AuditLog]
@@ -194,6 +203,8 @@ class Config:
 
         self.__read_config_file()
 
+        self.__read_config_file()
+
     def __read_config_file(self):
         """
         Read properties from config_file TOML and initialize config attributes.
@@ -212,9 +223,11 @@ class Config:
                 self.load_config(toml_doc)
 
                 self.check_ctd_config_dir()
+                self.check_processing_sequence()
                 self.setup_audit_log(toml_doc)
                 self.setup_latitude_service(toml_doc)
                 self.setup_charts(toml_doc)
+ 
 
     def __init_empty_config(self):
         """setup empty data structures for when toml is missing.
@@ -224,6 +237,24 @@ class Config:
     def __getitem__(self, key: str):
         new_attr = old_mapping[key]
         return getattr(self, new_attr)
+
+    def check_problems(self, toml_doc: tomlkit.TOMLDocument):
+        """
+        Check for config file problems
+        Exits program if any problems are found.
+        """
+        problems = []
+        for rule in deprecated:
+            msg = rule.check(toml_doc)
+            if msg:
+                problems.append(rule.message)
+
+        if problems:
+            lines = '\n'.join(problems)
+            s = 's' if len(problems) > 1 else ''
+            logging.error(f'config.toml has {len(problems)} problem{s} that must be fixed:\n{lines}')
+
+            sys.exit(1)
 
     def check_problems(self, toml_doc: tomlkit.TOMLDocument):
         """
@@ -323,6 +354,19 @@ class Config:
             logging.warning(f'''Invalid config properties: {invalid_str}
     These values are set to None and may crash the app with None/NoneType errors, see above warnings.''')
 
+    def check_processing_sequence(self):
+        """set default processing_sequence if not configured by user"""
+        if self.processing_sequence is None:
+            self.processing_sequence = [
+                {'function': 'dat_cnv', 'psa_file': 'DatCnv.psa', 'append': 'C'}, 
+                {'function': 'cell_thermal_mass', 'psa_file': 'CellTM.psa', 'append': 'T'}, 
+                {'function': 'filter', 'psa_file': 'Filter.psa', 'append': 'F'}, 
+                {'function': 'align_ctd', 'psa_file': 'AlignCTD.psa', 'append': 'A'}, 
+                {'function': 'loop_edit', 'psa_file': 'LoopEdit.psa', 'append': 'L'}, 
+                {'function': 'derive', 'psa_file': 'Derive.psa', 'append': 'D'}, 
+                {'function': 'bin_avg', 'psa_file': 'BinAvg.psa', 'append': 'B'},
+            ]
+
     def check_ctd_config_dir(self):
         """set default ctd_config_dir if not configured by user"""
         if self.ctd_config_dir is None:
@@ -335,7 +379,7 @@ class Config:
 
         elif not self.ctd_config_dir.is_dir():
             raise ConfigError(f'[paths] ctd_config directory does not exist: {self.ctd_config_dir}')
-
+        
     def find_config(self) -> Path:
         """Look for the app config file in the standard locations."""
         # TODO standard local config location? python lib support? NiceGUI?
@@ -450,7 +494,7 @@ class Config:
             # TODO test exception handling
             mdw_file = None
 
-        return OceanDB(mdb_file, mdw_file, self.db_user, self.db_password)
+        return OceanDB(mdb_file, mdw_file, self.db_user, self.db_password, self.tz_mapping)
 
 
     def get_db(self) -> OceanDB | None:
