@@ -16,7 +16,6 @@ from .latitude_spreadsheet import LatitudeSpreadsheet
 
 # map from old config keys to new Config attrs
 old_mapping = {
-    'USE_DATABASE': 'db_enabled',
     'RAW_PATH': 'raw_dir',
     'PROCESSING_PATH': 'processing_dir',
     'DESTINATION_PATH': 'approved_dir',
