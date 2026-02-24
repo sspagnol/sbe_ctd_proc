@@ -23,8 +23,9 @@ class CTDdataRecord():
     date_first_in_pos: datetime | str
 
 class OceanDB:
-    def __init__(self, db_file, mdw_file, db_user, db_password) -> None:
+    def __init__(self, db_file, mdw_file, db_user, db_password, tz_mapping: dict[str, str] | None = None) -> None:
         self.db_file = db_file
+        self.tz_mapping = tz_mapping or {}
         db_driver = r"{Microsoft Access Driver (*.mdb, *.accdb)}"
         if mdw_file is None:
             cnxn_str = (
@@ -58,13 +59,13 @@ class OceanDB:
             query_start = time.time()
             logging.debug('OceanDB create and connect took %sms', query_start - init_start)
 
-            self.field_trip = pd.read_sql('SELECT * FROM FieldTrip', engine, parse_dates=['DateStart', 'DateEnd'])
-            self.sites = pd.read_sql('SELECT * FROM Sites', engine)
-            self.deployment_data = pd.read_sql('SELECT * FROM DeploymentData', engine, parse_dates=['TimeDriftGPS', 'TimeFirstGoodData', 'TimeLastGoodData', 'TimeSwitchOff',
+            self.field_trip = pd.read_sql('SELECT * FROM FieldTrip', conn, parse_dates=['DateStart', 'DateEnd'])
+            self.sites = pd.read_sql('SELECT * FROM Sites', conn)
+            self.deployment_data = pd.read_sql('SELECT * FROM DeploymentData', conn, parse_dates=['TimeDriftGPS', 'TimeFirstGoodData', 'TimeLastGoodData', 'TimeSwitchOff',
                                 'TimeDriftInstrument', 'TimeFirstInPos', 'TimeLastInPos', 'TimeSwitchOn'
                                 'TimeEstimatedRetrieval', 'TimeFirstWet', 'TimeOnDeck'])
-            self.instruments = pd.read_sql('SELECT * FROM Instruments', engine)
-            self.ctd_data = pd.read_sql('SELECT * FROM CTDData', engine)
+            self.instruments = pd.read_sql('SELECT * FROM Instruments', conn)
+            self.ctd_data = pd.read_sql('SELECT * FROM CTDData', conn)
 
             logging.info('loading tables from %s took %sms, ctd_data has %s files',
                          self.db_file, time.time() - query_start, len(self.ctd_data))
@@ -92,11 +93,13 @@ class OceanDB:
         if not hasattr(self, "ctd_data"):
             self.__load_tables()
 
-        ctd_data = self.ctd_data
-        hex_filename = f'{base_file_name}.hex'
+        ctd_deployment = pd.DataFrame()
 
-        ctd_deployment = ctd_data[
-            ctd_data['Linkfile1'].str.contains(f'^{hex_filename}', case=case_sensitive, regex=True, na=False)]
+        hex_filename = f'{base_file_name}.hex'
+        match_on = f'hex filename "{hex_filename}"'
+
+        regex_pattern = f'^{base_file_name}'
+        ctd_deployment, match_column = self.__match_filename(regex_pattern, hex_filename, case_sensitive)
 
         if not ctd_deployment.empty:
             # hex filename match
@@ -115,15 +118,15 @@ class OceanDB:
             regex = f'^{base_file_name}C'
             # less confusing startswith text for logs and messages
             match_on = f'startswith "{regex[1:]}"'
-
-            ctd_deployment = ctd_data[
-                ctd_data['Linkfile1'].str.contains(regex, case=case_sensitive, regex=True, na=False)]
-
+            
+            regex_pattern = f'^{base_file_name}C'
+            ctd_data, match_column = self.__match_filename(regex_pattern, hex_filename, case_sensitive)
+        
             if ctd_deployment.empty:
                 # filename not in the db
-                raise LookupError(f'no ctd_data record Linkfile1 {match_on}')
+                raise LookupError(f'no ctd_data record FileName {match_on}')
             elif len(ctd_deployment) > 1:
-                raise LookupError(f'multiple ctd_data records Linkfile1 {match_on}')
+                raise LookupError(f'multiple ctd_data records FileName {match_on}')
 
         try:
             date_first_in_pos=self.__merge_datetime(ctd_deployment, 'DateFirstInPos', 'TimeFirstInPos', 'TimeZone')
@@ -133,7 +136,7 @@ class OceanDB:
 
         rec = CTDdataRecord(
             basename=base_file_name,
-            filename=ctd_deployment['Linkfile1'].values[0],
+            filename=ctd_deployment[match_column].values[0],
             lat=ctd_deployment['Latitude'].values[0],
             lon=ctd_deployment['Longitude'].values[0],
             cast_number=ctd_deployment['CastNumber'].values[0].item(),
@@ -185,10 +188,67 @@ class OceanDB:
         except Exception as e:
             raise InvalidTimeZoneException(f'Error with timezone "{tz}"') from e
 
+        try:
+            if tz.startswith('UTC-') or tz.startswith('UTC+'):
+                # values like UTC-31 or UTC+11
+                offset = tz[3:]
+                if len(offset) == 3:
+                    # add 00 to match required HHMM format
+                    offset = f'{offset}00'
+
+                # tz values like "UTC-31" will cause this error:
+                # ValueError: offset must be a timedelta strictly between -timedelta(hours=24) and timedelta(hours=24), not datetime.timedelta(days=-2, seconds=61200).
+                # could potentially workaround this by subtracting days
+                zoneinfo = datetime.strptime(offset, "%z").tzinfo
+            else:
+                zoneinfo = ZoneInfo(tz)
+        except Exception as e:
+            raise InvalidTimeZoneException(f'Error with timezone "{tz}"') from e
+
         dt = datetime(d2.year, d2.month, d2.day, t2.hour, t2.minute, t2.second, t2.microsecond, zoneinfo)
         #logging.debug('%s + %s (%s) = %s', d, t, tz, dt)
         return dt
 
+    def __match_filename(self, regex_pattern, hex_filename, case_sensitive):
+        
+        ctd_data = self.ctd_data
+        
+        ctd_deployment = pd.DataFrame()
+        match_column = ""
+        match_on = ""
+        
+        ctd_deployment_in_Linkfile1 = ctd_data[
+            ctd_data['Linkfile1'].str.contains(regex_pattern, case=case_sensitive, regex=True, na=False)]
 
+        ctd_deployment_in_FileName = ctd_data[
+            ctd_data['FileName'].str.contains(regex_pattern, case=case_sensitive, regex=True, na=False)]
+            
+        ctd_deployment = pd.DataFrame()
+        match_column = ""
+        if not ctd_deployment_in_Linkfile1.empty:
+            # hex filename match
+            match_on = f'hex filename "{hex_filename}"'
+            match_column = "Linkfile1"
+            if len(ctd_deployment_in_Linkfile1) > 1:
+                raise LookupError(f'multiple ctd_data Linkfile1 records match hex filename "{hex_filename}"')
+            ctd_deployment = ctd_deployment_in_Linkfile1.copy()
+        elif not ctd_deployment_in_FileName.empty:
+            # hex filename match
+            match_on = f'hex filename "{hex_filename}"'
+            match_column = "FileName"
+            if len(ctd_deployment_in_FileName) > 1:
+                raise LookupError(f'multiple ctd_data FileName records match hex filename "{hex_filename}"')
+            ctd_deployment = ctd_deployment_in_FileName.copy()   
+            
+        return ctd_deployment, match_column
+
+    def __map_tz(self, tz: str) -> str:
+        """Map db timezone string to an IANA timezone string"""
+        if tz in self.tz_mapping:
+            tz = self.tz_mapping[tz]
+        return tz
+        
 class InvalidTimeZoneException(ValueError):
     ...
+    
+
